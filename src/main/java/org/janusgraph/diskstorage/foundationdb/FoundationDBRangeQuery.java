@@ -16,42 +16,45 @@ package org.janusgraph.diskstorage.foundationdb;
 
 import com.apple.foundationdb.KeySelector;
 import com.apple.foundationdb.subspace.Subspace;
-
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.KVQuery;
 
+import java.util.Objects;
+
 /**
+ * Helper class to encapsulate FoundationDB specific query parameters
+ * derived from a JanusGraph {@link KVQuery}.
+ *
  * @author Florian Grieskamp
+ * @author JanusGraph Authors
  */
 public class FoundationDBRangeQuery {
 
     private final KVQuery originalQuery;
-    private KeySelector startKeySelector;
-    private KeySelector endKeySelector;
+    private final KeySelector startKeySelector;
+    private final KeySelector endKeySelector;
     private final int limit;
+    private final Subspace subspace; // Keep subspace for context
 
-    public FoundationDBRangeQuery(Subspace db, KVQuery kvQuery) {
-        originalQuery = kvQuery;
-        limit = kvQuery.getLimit();
+    public FoundationDBRangeQuery(Subspace subspace, KVQuery kvQuery) {
+        this.subspace = Objects.requireNonNull(subspace);
+        this.originalQuery = Objects.requireNonNull(kvQuery);
+        this.limit = kvQuery.getLimit();
 
         final StaticBuffer keyStart = kvQuery.getStart();
         final StaticBuffer keyEnd = kvQuery.getEnd();
 
-        byte[] startKey = (keyStart == null) ?
-                db.range().begin : db.pack(keyStart.as(FoundationDBKeyValueStore.ENTRY_FACTORY));
-        byte[] endKey = (keyEnd == null) ?
-                db.range().end : db.pack(keyEnd.as(FoundationDBKeyValueStore.ENTRY_FACTORY));
+        // Pack keys within the store's subspace
+        byte[] startKeyBytes = (keyStart == null || keyStart.length() == 0) ?
+            subspace.range().begin : subspace.pack(keyStart.as(FoundationDBKeyValueStore.ENTRY_FACTORY));
 
-        startKeySelector = KeySelector.firstGreaterOrEqual(startKey);
-        endKeySelector = KeySelector.firstGreaterOrEqual(endKey);
-    }
+        byte[] endKeyBytes = (keyEnd == null || keyEnd.length() == 0) ?
+            subspace.range().end : subspace.pack(keyEnd.as(FoundationDBKeyValueStore.ENTRY_FACTORY));
 
-    public void setStartKeySelector(KeySelector startKeySelector) {
-        this.startKeySelector = startKeySelector;
-    }
-
-    public void setEndKeySelector(KeySelector endKeySelector) {
-        this.endKeySelector = endKeySelector;
+        // Standard selectors: firstGreaterOrEqual for start, firstGreaterOrEqual for end (exclusive)
+        // FDB ranges are [start, end)
+        this.startKeySelector = KeySelector.firstGreaterOrEqual(startKeyBytes);
+        this.endKeySelector = KeySelector.firstGreaterOrEqual(endKeyBytes); // Usually corresponds to the start of the *next* key
     }
 
     public KVQuery asKVQuery() { return originalQuery; }

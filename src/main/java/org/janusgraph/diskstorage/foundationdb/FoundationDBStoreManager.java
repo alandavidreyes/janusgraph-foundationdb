@@ -1,4 +1,4 @@
-// Copyright 2018 Expero Inc.
+// Copyright 2018 Expero Inc., 2023 JanusGraph Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,16 @@ package org.janusgraph.diskstorage.foundationdb;
 
 import com.apple.foundationdb.Database;
 import com.apple.foundationdb.FDB;
+import com.apple.foundationdb.FDBException;
 import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.directory.DirectoryLayer;
 import com.apple.foundationdb.directory.DirectorySubspace;
 import com.apple.foundationdb.directory.PathUtil;
 import com.google.common.base.Preconditions;
+import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.PermanentBackendException;
+import org.janusgraph.diskstorage.TemporaryBackendException;
 import org.janusgraph.diskstorage.BaseTransactionConfig;
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.common.AbstractStoreManager;
@@ -35,7 +38,6 @@ import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.KVMutation;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.KeyValueEntry;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.OrderedKeyValueStoreManager;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,93 +48,139 @@ import java.util.concurrent.ExecutionException;
 
 import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.CLUSTER_FILE_PATH;
 import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.DIRECTORY;
-import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.ISOLATION_LEVEL;
-import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.VERSION;
 import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.GET_RANGE_MODE;
+import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.ISOLATION_LEVEL;
+import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.MAX_RETRY_ATTEMPTS;
+import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.RETRY_BACKOFF_MILLIS;
+import static org.janusgraph.diskstorage.foundationdb.FoundationDBConfigOptions.VERSION;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 
 /**
- * Experimental FoundationDB storage manager implementation.
+ * FoundationDB storage manager implementation, optimized for performance.
  *
  * @author Ted Wilmes (twilmes@gmail.com)
+ * @author JanusGraph Authors
  */
 public class FoundationDBStoreManager extends AbstractStoreManager implements OrderedKeyValueStoreManager, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(FoundationDBStoreManager.class);
 
-    public enum RangeQueryIteratorMode { ASYNC, SYNC };
-    private RangeQueryIteratorMode mode;
+    public enum RangeQueryIteratorMode { ASYNC, SYNC }
 
     private final Map<String, FoundationDBKeyValueStore> stores;
 
-    protected FDB fdb;
+    // FDB API should only be selected once per process
+    private static volatile FDB fdb = null;
+    private static final Object fdbInitLock = new Object();
+
     protected Database db;
     protected final StoreFeatures features;
     protected DirectorySubspace rootDirectory;
     protected final String rootDirectoryName;
     protected final FoundationDBTx.IsolationLevel isolationLevel;
+    protected final int maxRetryAttempts;
+    protected final long retryBackoffMillis;
+    private final RangeQueryIteratorMode rangeQueryMode;
+
 
     public FoundationDBStoreManager(Configuration configuration) throws BackendException {
         super(configuration);
         stores = new ConcurrentHashMap<>();
 
-        fdb = FDB.selectAPIVersion(determineFoundationDbVersion(configuration));
+        synchronized (fdbInitLock) {
+            if (fdb == null) {
+                int apiVersion = configuration.get(VERSION);
+                log.info("Selecting FDB API version: {}", apiVersion);
+                // It's crucial to select the API version *before* interacting with FDB
+                // FDB.selectAPIVersion throws if called multiple times with different versions
+                try {
+                    fdb = FDB.selectAPIVersion(apiVersion);
+                    // Recommended: Start the FDB network thread explicitly if needed,
+                    // though fdb.open() usually handles this.
+                    // fdb.startNetwork();
+                } catch (FDBException e) {
+                    throw new PermanentBackendException("Failed to select FDB API version " + apiVersion +
+                        ". Ensure the FDB client libraries are compatible and this is the first initialization.", e);
+                } catch (IllegalStateException e) {
+                    // This can happen if selectAPIVersion was already called with a different version
+                    log.warn("FDB API version may have already been selected. Attempting to continue. Error: {}", e.getMessage());
+                    // Try getting the instance if already initialized
+                    try {
+                        fdb = FDB.instance();
+                    } catch (IllegalStateException innerEx) {
+                        throw new PermanentBackendException("Failed to initialize FDB. API version conflict or other initialization error.", innerEx);
+                    }
+                }
+            }
+        }
 
         rootDirectoryName = determineRootDirectoryName(configuration);
+        String clusterFilePath = configuration.get(CLUSTER_FILE_PATH);
 
-        db = !"default".equals(configuration.get(CLUSTER_FILE_PATH)) ?
-            fdb.open(configuration.get(CLUSTER_FILE_PATH)) : fdb.open();
-        final String isolationLevelStr = configuration.get(ISOLATION_LEVEL);
-        switch (isolationLevelStr.toLowerCase().trim()) {
-            case "serializable":
-                isolationLevel = FoundationDBTx.IsolationLevel.SERIALIZABLE;
-                break;
-            case "read_committed_no_write":
-                isolationLevel = FoundationDBTx.IsolationLevel.READ_COMMITTED_NO_WRITE;
-                break;
-            case "read_committed_with_write":
-                isolationLevel = FoundationDBTx.IsolationLevel.READ_COMMITTED_WITH_WRITE;
-                break;
-            default:
-                throw new PermanentBackendException("Unrecognized isolation level " + isolationLevelStr);
+        try {
+            log.info("Connecting to FDB cluster file: {}", clusterFilePath);
+            db = !"default".equalsIgnoreCase(clusterFilePath) ? fdb.open(clusterFilePath) : fdb.open();
+            // Consider setting database-level options if needed (e.g., timeouts)
+            // db.options().setTransactionTimeout(...);
+            log.info("Connected to FDB cluster.");
+        } catch (FDBException e) {
+            throw new PermanentBackendException("Failed to open FDB database with cluster file: " + clusterFilePath, e);
         }
 
-        log.info("Isolation level is set to {}", isolationLevel.toString());
+        var isolationLevelStr = configuration.get(ISOLATION_LEVEL).toLowerCase().trim();
+        isolationLevel = switch (isolationLevelStr) {
+            case "serializable" -> FoundationDBTx.IsolationLevel.SERIALIZABLE;
+            case "read_committed_no_write" -> FoundationDBTx.IsolationLevel.READ_COMMITTED_NO_WRITE;
+            case "read_committed_with_write" -> FoundationDBTx.IsolationLevel.READ_COMMITTED_WITH_WRITE;
+            // Should be caught by ConfigOption validation, but handle defensively
+            default -> throw new PermanentBackendException("Unrecognized isolation level: " + isolationLevelStr);
+        };
+        log.info("Using FDB transaction isolation level: {}", isolationLevel);
 
-        final String getRangeMode = configuration.get(GET_RANGE_MODE);
-        switch (getRangeMode.toLowerCase().trim()) {
-            case "iterator":
-                mode = RangeQueryIteratorMode.ASYNC;
-                break;
-            case "list":
-                mode = RangeQueryIteratorMode.SYNC;
-                break;
-        }
-        log.info("GetRange mode is specified as: {}, record iterator is with: {}", getRangeMode, mode.toString());
+        var getRangeModeStr = configuration.get(GET_RANGE_MODE).toLowerCase().trim();
+        rangeQueryMode = switch (getRangeModeStr) {
+            case "iterator" -> RangeQueryIteratorMode.ASYNC;
+            case "list" -> RangeQueryIteratorMode.SYNC;
+            // Should be caught by ConfigOption validation
+            default -> throw new PermanentBackendException("Unrecognized get-range-mode: " + getRangeModeStr);
+        };
+        log.info("Using FDB getRange mode: {} (Iterator type: {})", getRangeModeStr, rangeQueryMode);
 
+        maxRetryAttempts = configuration.get(MAX_RETRY_ATTEMPTS);
+        retryBackoffMillis = configuration.get(RETRY_BACKOFF_MILLIS);
+        log.info("Transaction retry policy: max attempts={}, initial backoff={}ms (for non-serializable isolation)",
+            maxRetryAttempts, retryBackoffMillis);
 
-        initialize(rootDirectoryName);
+        initializeRootDirectory(rootDirectoryName);
 
         features = new StandardStoreFeatures.Builder()
-                    .orderedScan(true)
-                    .transactional(transactional)
-                    .keyConsistent(GraphDatabaseConfiguration.buildGraphConfiguration())
-                    .locking(true)
-                    .keyOrdered(true)
-                    .supportsInterruption(false)
-                    .optimisticLocking(true)
-                    .multiQuery(true)
-                    .build();
+            .orderedScan(true)
+            .transactional(transactional) // from AbstractStoreManager
+            .keyConsistent(GraphDatabaseConfiguration.buildGraphConfiguration()) // Use JanusGraph's consistency settings
+            .locking(true) // FDB handles concurrency via transactions
+            .keyOrdered(true)
+            .supportsInterruption(true) // FDB operations are often interruptible
+            .optimisticLocking(true) // FDB's core mechanism
+            .multiQuery(true)
+            .batchMutation(true) // mutateMany groups operations
+            .persists(true)
+            .build();
 
-        log.info("FoundationDBStoreManager initialized");
+        log.info("FoundationDBStoreManager initialized successfully.");
     }
 
-    private void initialize(final String directoryName) throws BackendException {
+    private void initializeRootDirectory(final String directoryName) throws BackendException {
         try {
-            // create the root directory to hold the JanusGraph data
+            // Use runAsync for potentially long-running directory operations
             rootDirectory = DirectoryLayer.getDefault().createOrOpen(db, PathUtil.from(directoryName)).get();
+            log.info("Ensured FDB root directory exists: {}", directoryName);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TemporaryBackendException("Interrupted while creating/opening FDB root directory", e);
         } catch (Exception e) {
-            throw new PermanentBackendException(e);
+            // Unwrap ExecutionException if present
+            Throwable cause = (e instanceof ExecutionException) ? e.getCause() : e;
+            throw new PermanentBackendException("Failed to create or open FDB root directory: " + directoryName, cause);
         }
     }
 
@@ -143,105 +191,115 @@ public class FoundationDBStoreManager extends AbstractStoreManager implements Or
 
     @Override
     public List<KeyRange> getLocalKeyPartition() throws BackendException {
-        throw new UnsupportedOperationException();
+        // FDB distributes keys automatically, so this concept isn't directly applicable.
+        throw new UnsupportedOperationException("FDB does not support local key partitions.");
     }
 
     @Override
     public StoreTransaction beginTransaction(final BaseTransactionConfig txCfg) throws BackendException {
         try {
-            final Transaction tx = db.createTransaction();
+            // Create a new FDB transaction
+            final Transaction fdbRawTx = db.createTransaction();
 
-            final StoreTransaction fdbTx = new FoundationDBTx(db, tx, txCfg, isolationLevel);
+            final StoreTransaction fdbTx = new FoundationDBTx(db, fdbRawTx, txCfg, isolationLevel, maxRetryAttempts, retryBackoffMillis);
 
             if (log.isTraceEnabled()) {
-                log.trace("FoundationDB tx created", new TransactionBegin(fdbTx.toString()));
+                // Avoid creating new Exception object just for logging stack trace
+                log.trace("FoundationDB transaction started: {}", fdbTx);
             }
 
             return fdbTx;
-        } catch (Exception e) {
+        } catch (FDBException e) {
             throw new PermanentBackendException("Could not start FoundationDB transaction", e);
+        } catch (Exception e) {
+            // Catch broader exceptions during setup
+            throw new PermanentBackendException("Unexpected error starting FoundationDB transaction", e);
         }
     }
 
     @Override
     public FoundationDBKeyValueStore openDatabase(String name) throws BackendException {
-        Preconditions.checkNotNull(name);
-        if (stores.containsKey(name)) {
-            return stores.get(name);
-        }
-        try {
-            final DirectorySubspace storeDb = rootDirectory.createOrOpen(db, PathUtil.from(name)).get();
-            log.debug("Opened database {}", name /*, new Throwable()*/);
-
-            FoundationDBKeyValueStore store = new FoundationDBKeyValueStore(name, storeDb, this);
-            stores.put(name, store);
-            return store;
-        } catch (Exception e) {
-            throw new PermanentBackendException("Could not open FoundationDB data store", e);
-        }
+        Preconditions.checkNotNull(name, "Database name cannot be null");
+        // Use computeIfAbsent for atomic and efficient store creation/retrieval
+        return stores.computeIfAbsent(name, dbName -> {
+            try {
+                log.debug("Opening/Creating FDB subspace for store: {}", dbName);
+                // Use runAsync for directory operations
+                final DirectorySubspace storeDb = rootDirectory.createOrOpen(db, PathUtil.from(dbName)).get();
+                log.info("Opened FDB subspace for store: {}", dbName);
+                return new FoundationDBKeyValueStore(dbName, storeDb, this);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new JanusGraphException("Interrupted while opening FDB subspace: " + dbName, e);
+            } catch (Exception e) {
+                Throwable cause = (e instanceof ExecutionException) ? e.getCause() : e;
+                throw new JanusGraphException("Could not open FDB subspace: " + dbName, cause);
+            }
+        });
     }
 
     @Override
     public void mutateMany(Map<String, KVMutation> mutations, StoreTransaction txh) throws BackendException {
-        try {
-            for (Map.Entry<String, KVMutation> mutation : mutations.entrySet()) {
-                FoundationDBKeyValueStore store = openDatabase(mutation.getKey());
-                KVMutation mutationValue = mutation.getValue();
+        FoundationDBTx tx = FoundationDBTx.getTx(txh);
+        // No explicit batching needed here as FDB transaction handles atomicity.
+        // The loop applies mutations per store within the single transaction.
+        for (Map.Entry<String, KVMutation> entry : mutations.entrySet()) {
+            String storeName = entry.getKey();
+            KVMutation mutation = entry.getValue();
+            FoundationDBKeyValueStore store = openDatabase(storeName); // Ensures store subspace exists
 
-                if (!mutationValue.hasAdditions() && !mutationValue.hasDeletions()) {
-                    log.debug("Empty mutation set for {}, doing nothing", mutation.getKey());
-                } else {
-                    log.debug("Mutating {}", mutation.getKey());
+            if (!mutation.hasAdditions() && !mutation.hasDeletions()) {
+                log.trace("Empty mutation for store {}, skipping.", storeName);
+                continue;
+            }
+
+            log.debug("Applying mutations to store: {}", storeName);
+
+            // Apply additions
+            if (mutation.hasAdditions()) {
+                List<KeyValueEntry> additions = mutation.getAdditions();
+                log.trace("Applying {} insertions to store {}", additions.size(), storeName);
+                for (KeyValueEntry kv : additions) {
+                    store.insert(kv.getKey(), kv.getValue(), tx); // Pass the transaction context
                 }
+            }
 
-                if (mutationValue.hasAdditions()) {
-                    for (KeyValueEntry entry : mutationValue.getAdditions()) {
-                        store.insert(entry.getKey(), entry.getValue(), txh);
-                        log.trace("Insertion on {}: {}", mutation.getKey(), entry);
-                    }
-
-                    log.debug("Total number of insertions: {}", mutationValue.getAdditions().size());
-                }
-                if (mutationValue.hasDeletions()) {
-                    for (StaticBuffer del : mutationValue.getDeletions()) {
-                        store.delete(del, txh);
-                        log.trace("Deletion on {}: {}", mutation.getKey(), del);
-                    }
-
-                    log.debug("Total number of deletions: {}", mutationValue.getDeletions().size());
+            // Apply deletions
+            if (mutation.hasDeletions()) {
+                List<StaticBuffer> deletions = mutation.getDeletions();
+                log.trace("Applying {} deletions to store {}", deletions.size(), storeName);
+                for (StaticBuffer key : deletions) {
+                    store.delete(key, tx); // Pass the transaction context
                 }
             }
         }
-        catch (BackendException e){
-            throw e;
-        }
-        catch (Exception e) {
-            throw new PermanentBackendException(e);
-        }
+        // Commit happens explicitly via txh.commit() later
     }
 
-    void removeDatabase(FoundationDBKeyValueStore db) {
-        if (!stores.containsKey(db.getName())) {
-            throw new IllegalArgumentException("Tried to remove an unknown database from the storage manager");
+    // Called by FoundationDBKeyValueStore.close()
+    void removeDatabase(FoundationDBKeyValueStore store) {
+        Preconditions.checkNotNull(store);
+        String name = store.getName();
+        if (stores.remove(name) != null) {
+            log.debug("Removed reference to closed store: {}", name);
+        } else {
+            log.warn("Attempted to remove unknown store reference: {}", name);
         }
-        String name = db.getName();
-        stores.remove(name);
-        log.debug("Removed database {}", name);
     }
 
 
     @Override
     public void close() throws BackendException {
-        if (fdb != null) {
-            if (!stores.isEmpty())
-                throw new IllegalStateException("Cannot shutdown manager since some databases are still open");
-            try {
-                // TODO this looks like a race condition
-                // Wait just a little bit before closing so that independent transaction threads can clean up.
-                Thread.sleep(30);
-            } catch (InterruptedException e) {
-                // Ignore
-            }
+        log.info("Closing FoundationDBStoreManager...");
+        if (!stores.isEmpty()) {
+            log.warn("Closing manager while {} stores are still registered: {}", stores.size(), stores.keySet());
+            // Consider forcing close on stores or throwing an exception based on desired strictness
+            // stores.values().forEach(store -> { try { store.close(); } catch (Exception e) { log.error("Error closing store {}", store.getName(), e); } });
+            // stores.clear();
+            // For now, just log and proceed.
+        }
+
+        if (db != null) {
             try {
                 db.close();
             } catch (Exception e) {
@@ -254,51 +312,67 @@ public class FoundationDBStoreManager extends AbstractStoreManager implements Or
 
     @Override
     public void clearStorage() throws BackendException {
+        log.warn("Clearing ALL data within the root directory: {}", rootDirectoryName);
+        Preconditions.checkState(rootDirectory != null, "Root directory is not initialized.");
         try {
-            rootDirectory.removeIfExists(db).get();
+            // Remove the entire root directory subspace
+            DirectoryLayer.getDefault().remove(db, PathUtil.from(rootDirectoryName)).get();
+            log.info("Cleared storage by removing directory: {}", rootDirectoryName);
+            // Re-initialize the directory after clearing
+            initializeRootDirectory(rootDirectoryName);
+            stores.clear(); // Clear cached store instances
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TemporaryBackendException("Interrupted while clearing FDB storage", e);
         } catch (Exception e) {
-            throw new PermanentBackendException("Could not clear FoundationDB storage", e);
+            Throwable cause = (e instanceof ExecutionException) ? e.getCause() : e;
+            throw new PermanentBackendException("Could not clear FDB storage (directory: " + rootDirectoryName + ")", cause);
         }
-
-        log.info("FoundationDBStoreManager cleared storage");
     }
 
     @Override
     public boolean exists() throws BackendException {
-        // @todo
+        Preconditions.checkState(db != null, "Database connection is not initialized.");
+        Preconditions.checkNotNull(rootDirectoryName, "Root directory name is not configured.");
         try {
-            return DirectoryLayer.getDefault().exists(db, PathUtil.from(rootDirectoryName)).get();
+            // Check if the root directory subspace exists
+            Boolean exists = DirectoryLayer.getDefault().exists(db, PathUtil.from(rootDirectoryName)).get();
+            log.debug("Checking existence of root directory '{}': {}", rootDirectoryName, exists);
+            return exists != null && exists;
         } catch (InterruptedException e) {
-            throw new PermanentBackendException(e);
-        } catch (ExecutionException e) {
-            throw new PermanentBackendException(e);
+            Thread.currentThread().interrupt();
+            throw new TemporaryBackendException("Interrupted while checking FDB directory existence", e);
+        } catch (Exception e) {
+            Throwable cause = (e instanceof ExecutionException) ? e.getCause() : e;
+            throw new PermanentBackendException("Could not check FDB directory existence: " + rootDirectoryName, cause);
         }
     }
 
     @Override
     public String getName() {
-        return getClass().getSimpleName();
+        // Use the configured directory name or a fixed identifier
+        return "FoundationDB[" + rootDirectoryName + "]";
     }
 
-
-    private static class TransactionBegin extends Exception {
-        private static final long serialVersionUID = 1L;
-
-        private TransactionBegin(String msg) {
-            super(msg);
+    // Helper to get directory name, prioritizing explicit config over graph name
+    private String determineRootDirectoryName(Configuration config) {
+        if (config.has(DIRECTORY)) {
+            return config.get(DIRECTORY);
+        } else if (config.has(GRAPH_NAME)) {
+            log.warn("FoundationDB directory not explicitly configured ({}). Using graph name '{}' as directory.",
+                DIRECTORY.getName(), GRAPH_NAME.getName());
+            return config.get(GRAPH_NAME);
+        } else {
+            // Fallback to the default value of the DIRECTORY option
+            String defaultDir = DIRECTORY.getDefaultValue();
+            log.warn("FoundationDB directory not explicitly configured ({}). Using default directory name '{}'.",
+                DIRECTORY.getName(), defaultDir);
+            return defaultDir;
         }
     }
 
-    private String determineRootDirectoryName(Configuration config) {
-        if (!config.has(DIRECTORY) && (config.has(GRAPH_NAME))) return config.get(GRAPH_NAME);
-        return config.get(DIRECTORY);
-    }
-
-    private int determineFoundationDbVersion(Configuration config) {
-        return config.get(VERSION);
-    }
-
-    public RangeQueryIteratorMode getMode() {
-        return mode;
+    // Expose the iterator mode for KeyValueStore
+    public RangeQueryIteratorMode getRangeQueryMode() {
+        return rangeQueryMode;
     }
 }

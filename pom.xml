@@ -1,24 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>org.janusgraph</groupId>
     <artifactId>janusgraph-foundationdb</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>JanusGraph FoundationDB Storage Adapter</name>
 
     <properties>
-        <maven.compiler.plugin.version>3.8.1</maven.compiler.plugin.version>
-        <jdk.version>1.8</jdk.version>
-        <janusgraph.version>0.5.2</janusgraph.version>
-        <foundationdb.version>6.2.22</foundationdb.version>
-        <dependency.plugin.version>3.2.0</dependency.plugin.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.plugin.version>3.11.0</maven.compiler.plugin.version>
+        <jdk.version>21</jdk.version>
+        <janusgraph.version>1.1.0</janusgraph.version>
+        <foundationdb.version>7.4.1</foundationdb.version>
+        <slf4j.version>2.0.17</slf4j.version>
+        <dependency.plugin.version>3.6.0</dependency.plugin.version>
+        <surefire.plugin.version>3.1.2</surefire.plugin.version>
+        <assembly.plugin.version>3.6.0</assembly.plugin.version>
         <test.skip.default>false</test.skip.default>
         <test.skip.tp>true</test.skip.tp>
-        <testcontainers.version>1.15.3</testcontainers.version>
+        <testcontainers.version>1.21.0</testcontainers.version>
     </properties>
 
     <developers>
@@ -58,6 +62,8 @@
             <artifactId>fdb-java</artifactId>
             <version>${foundationdb.version}</version>
         </dependency>
+
+        <!-- Test dependencies -->
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
@@ -70,6 +76,13 @@
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Ensure SLF4J binding for logging during tests -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-reload4j</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -79,36 +92,27 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>${maven.compiler.plugin.version}</version>
                 <configuration>
-                    <source>${jdk.version}</source>
-                    <target>${jdk.version}</target>
+                    <!-- Use release for better toolchain compliance -->
+                    <release>${jdk.version}</release>
+                    <compilerArgs>
+                        <arg>--enable-preview</arg> <!-- If using preview features -->
+                        <arg>-Xlint:all</arg>
+                    </compilerArgs>
+                    <encoding>${project.build.sourceEncoding}</encoding>
                 </configuration>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-dependency-plugin</artifactId>
-                <version>${dependency.plugin.version}</version>
-                <executions>
-                    <execution>
-                        <id>copy-dependencies</id>
-                        <phase>prepare-package</phase>
-                        <goals>
-                            <goal>copy-dependencies</goal>
-                        </goals>
-                        <configuration>
-                            <outputDirectory>${project.build.directory}/lib</outputDirectory>
-                            <includeScope>compile</includeScope>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-            <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>2.22.1</version>
+                <version>${surefire.plugin.version}</version>
                 <configuration>
+                    <!-- Add JVM args for preview features if needed -->
+                    <argLine>--enable-preview</argLine>
                     <parallel>none</parallel>
                     <runOrder>alphabetical</runOrder>
                     <failIfNoTests>false</failIfNoTests>
                     <excludes>
+                        <!-- Review these exclusions - maybe run more tests -->
                         <exclude>**/*PerformanceTest.java</exclude>
                         <exclude>**/*ConcurrentTest.java</exclude>
                         <exclude>**/*Groovy*Test.java</exclude>
@@ -118,10 +122,10 @@
                         <exclude>**/*StructureTest.java</exclude>
                     </excludes>
                     <skip>${test.skip.default}</skip>
-                    <!-- Use log4j.properties from module test resources -->
                     <systemProperties>
                         <property>
                             <name>log4j.configuration</name>
+                            <!-- Consider logback or log4j2 for modern logging -->
                             <value>file:${project.build.directory}/test-classes/log4j.properties</value>
                         </property>
                     </systemProperties>
@@ -158,8 +162,26 @@
                 </executions>
             </plugin>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>${dependency.plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>copy-dependencies</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy-dependencies</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/lib</outputDirectory>
+                            <includeScope>runtime</includeScope> <!-- Usually want runtime deps -->
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
                 <artifactId>maven-assembly-plugin</artifactId>
-                <version>2.5.3</version>
+                <version>${assembly.plugin.version}</version>
                 <configuration>
                     <descriptor>src/assembly/dep.xml</descriptor>
                 </configuration>

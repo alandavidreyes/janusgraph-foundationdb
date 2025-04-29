@@ -20,63 +20,99 @@ import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.KeySelector;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.KeyValueEntry;
 import org.janusgraph.diskstorage.util.RecordIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 
 import java.util.Iterator;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 
+/**
+ * A RecordIterator wrapping a standard Java Iterator over FoundationDB KeyValue pairs,
+ * typically used for synchronous (in-memory list) results. Applies filtering via KeySelector.
+ */
 public class FoundationDBRecordIterator implements RecordIterator<KeyValueEntry> {
-    protected final Subspace ds;
-    protected Iterator<KeyValue> entries;
+    private static final Logger log = LoggerFactory.getLogger(FoundationDBRecordIterator.class);
+
+    protected final Subspace subspace; // Used for unpacking keys
+    protected final Iterator<KeyValue> entries;
     protected final KeySelector selector;
-    // Keeping track of the entries being scanned, which is different from the selected entries returned to the caller
-    // due to selector
-    protected int fetched;
+
+    // State for lazy fetching and filtering
     protected KeyValueEntry nextKeyValueEntry;
+    protected boolean initialNextCalled = false; // Tracks if hasNext logic has run at least once
 
-    public FoundationDBRecordIterator(Subspace ds, final Iterator<KeyValue> keyValues, KeySelector selector) {
-        this.ds = ds;
-        this.selector = selector;
-
-        entries = keyValues;
-        fetched = 0;
-        nextKeyValueEntry = null;
+    public FoundationDBRecordIterator(Subspace subspace, Iterator<KeyValue> keyValues, KeySelector selector) {
+        this.subspace = Objects.requireNonNull(subspace);
+        this.entries = Objects.requireNonNull(keyValues);
+        this.selector = Objects.requireNonNull(selector);
+        this.nextKeyValueEntry = null; // Start with no entry prefetched
+        log.trace("FoundationDBRecordIterator created.");
     }
 
     @Override
     public boolean hasNext() {
-        fetchNext();
-        return (nextKeyValueEntry != null);
+        // Fetch the next valid entry if we haven't already or if the last one was consumed
+        if (nextKeyValueEntry == null) {
+            fetchNextMatchingEntry();
+        }
+        return nextKeyValueEntry != null;
     }
 
     @Override
     public KeyValueEntry next() {
-        if (hasNext()) {
-            KeyValueEntry result = nextKeyValueEntry;
-            nextKeyValueEntry = null;
-            return result;
-        }
-        else {
+        if (!hasNext()) { // Ensures fetchNextMatchingEntry has been called
             throw new NoSuchElementException();
         }
+        // Consume the prefetched entry
+        KeyValueEntry result = nextKeyValueEntry;
+        nextKeyValueEntry = null; // Reset so hasNext fetches the *next* one
+        return result;
     }
 
-    protected void fetchNext() {
-        while (nextKeyValueEntry == null && entries.hasNext()) {
+    /**
+     * Advances the underlying iterator until an entry matching the KeySelector is found,
+     * or the iterator is exhausted. Stores the matching entry in nextKeyValueEntry.
+     */
+    protected void fetchNextMatchingEntry() {
+        log.trace("Fetching next matching entry...");
+        while (entries.hasNext()) {
             KeyValue kv = entries.next();
-            fetched++;
-            StaticBuffer key = FoundationDBKeyValueStore.getBuffer(ds.unpack(kv.getKey()).getBytes(0));
+            byte[] rawKey = kv.getKey();
+            StaticBuffer key;
+            try {
+                // Unpack the key relative to the store's subspace
+                key = FoundationDBKeyValueStore.getBuffer(subspace.unpack(rawKey).getBytes(0));
+            } catch (IllegalArgumentException e) {
+                log.warn("Failed to unpack key '{}' from subspace '{}'. Skipping.", rawKey, subspace.getKey(), e);
+                continue; // Skip keys that don't belong to the subspace
+            }
+
             if (selector.include(key)) {
-                nextKeyValueEntry = new KeyValueEntry (key, FoundationDBKeyValueStore.getBuffer(kv.getValue()));
+                // Found a matching entry
+                nextKeyValueEntry = new KeyValueEntry(key, FoundationDBKeyValueStore.getBuffer(kv.getValue()));
+                log.trace("Found matching entry for key: {}", key);
+                return; // Exit the loop, entry is stored
+            } else {
+                log.trace("Key {} excluded by selector.", key);
             }
         }
+        // If loop finishes without finding an entry, nextKeyValueEntry remains null
+        log.trace("No more matching entries found.");
     }
+
 
     @Override
     public void close() {
+        // No specific resources to close for a standard Iterator wrapper
+        log.trace("FoundationDBRecordIterator closed.");
+        // If the underlying iterator implemented Closeable, we'd call it here.
     }
 
     @Override
     public void remove() {
-        throw new UnsupportedOperationException();
+        // Read-only iterator
+        throw new UnsupportedOperationException("Remove operation is not supported.");
     }
 }
